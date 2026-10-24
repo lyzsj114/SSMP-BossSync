@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using SSMP.Game.Client.Save;
+using SSMP.Logging;
+
+namespace SSMP.Game.Server.Save;
+
+/// <summary>
+/// JSON converter class to handle converting a list of entries for a mod save file into and from JSON.
+/// </summary>
+public class PlayerSaveDataConverter : JsonConverter {
+    /// <inheritdoc />
+    public override void WriteJson(JsonWriter writer, object? value, JsonSerializer serializer) {
+        if (value == null) {
+            return;
+        }
+        
+        var entries = (ModSaveFile.PlayerDataEntries) value;
+        
+        // Create a JSON object as the basis for the list of entries
+        var jObject = new JObject();
+
+        // Then for each entry we add the name and value as a property to the object
+        foreach (var entry in entries) {
+            // The use of the 'serializer' in the FromObject is important to ensure we allow earlier defined converters
+            // from acting on nested objects in the value of the entry (such as Unity's Vector3 being handled by
+            // the modding API's Vector3 converter)
+            jObject.Add(entry.Name!, entry.Value == null ? JValue.CreateNull() : JToken.FromObject(entry.Value, serializer));
+        }
+
+        // Finally, write the JSON object to the writer
+        jObject.WriteTo(writer);
+    }
+
+    /// <inheritdoc />
+    public override object ReadJson(JsonReader reader, Type objectType, object? existingValue, JsonSerializer serializer) {
+        // We know that our JSON will have a JSON object, so we can read it
+        var jObject = JObject.Load(reader);
+
+        var entries = new ModSaveFile.PlayerDataEntries();
+
+        // Loop over all properties of the object, since these are the entries in our ModSaveFile
+        foreach (var prop in jObject.Properties()) {
+            // Create the entry with the name only
+            var entry = new ModSaveFile.PlayerDataEntry {
+                Name = prop.Name
+            };
+
+            // Find the variable properties that correspond to the PlayerData variable name from this JSON property's
+            // name
+            if (!SaveDataMapping.Instance.PlayerDataVarProperties.TryGetValue(prop.Name, out var varProps)) {
+                Logger.Warn($"Could not deserialize ModSaveFile.Entry, because variable '{prop.Name}' has no variable properties, skipping");
+                continue;
+            }
+
+            if (!varProps.Sync) {
+                Logger.Debug($"Variable properties for '{prop.Name}' indicate no sync, skipping");
+                continue;
+            }
+
+            // From the variable properties, we obtain the type for the value of this JSON property
+            if (varProps.Json) {
+                entry.Value = prop.Value.DeepClone();
+                entries.Add(entry);
+                continue;
+            }
+
+            var typeString = varProps.VarType;
+            // The save data JSON uses C# syntax for this type, which Type.GetType can't resolve
+            var type = typeString == "HashSet<string>" ? typeof(HashSet<string>) : Type.GetType(typeString);
+
+            if (type == null) {
+                Logger.Warn($"Could not deserialize ModSaveFile.Entry, because var type '{typeString}' could not be found, skipping");
+                continue;
+            }
+
+            // Then we can convert the JSON property's value
+            // The use of the 'serializer' here is important to ensure we allow earlier defined converters from acting
+            // on nested objects in the value of the entry (such as Unity's Vector3 being handled by the modding API's
+            // Vector3 converter)
+            // Builds through 0.3.1.1 mislabeled the six memory-orb bitmaps as Int32.
+            // Reinterpret a negative legacy value as its original low 32 bits; never sign-extend it.
+            if (type == typeof(ulong) && prop.Name.StartsWith("memoryOrbs_Clover_", StringComparison.Ordinal) &&
+                prop.Value.Type == JTokenType.Integer && prop.Value.ToString().StartsWith("-", StringComparison.Ordinal)) {
+                entry.Value = (ulong) unchecked((uint) prop.Value.ToObject<int>());
+                Logger.Warn($"Migrated legacy 32-bit memory-orb value for {prop.Name}; previously lost high bits cannot be recovered");
+            } else {
+                entry.Value = prop.Value.ToObject(type, serializer);
+            }
+            entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    /// <inheritdoc />
+    public override bool CanConvert(Type objectType) {
+        return objectType == typeof(ModSaveFile.PlayerDataEntries);
+    }
+}

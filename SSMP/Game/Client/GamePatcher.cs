@@ -1,0 +1,907 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using HutongGames.PlayMaker.Actions;
+using Mono.Cecil.Cil;
+using MonoMod.Cil;
+using MonoMod.RuntimeDetour;
+using SSMP.Hooks;
+using SSMP.Networking.Client;
+using SSMP.Game.Client.Entity;
+using SSMP.Util;
+using UnityEngine;
+using Logger = SSMP.Logging.Logger;
+
+namespace SSMP.Game.Client;
+
+/// <summary>
+/// Registers and owns standalone multiplayer patches for player-only interactions, enemy target actions,
+/// camera locks, damage feedback, and transition filtering.
+/// </summary>
+internal partial class GamePatcher {
+    /// <summary>
+    /// Binding flags used to access private instance members through reflection.
+    /// </summary>
+    private const BindingFlags InstanceNonPublicFlags = BindingFlags.NonPublic | BindingFlags.Instance;
+
+    /// <summary>
+    /// Binding flags used to access public instance members through reflection.
+    /// </summary>
+    private const BindingFlags InstancePublicFlags = BindingFlags.Public | BindingFlags.Instance;
+
+    /// <summary>
+    /// Binding flags used to access private, public, and static members through reflection.
+    /// </summary>
+    private const BindingFlags StaticNonPublicPublicFlags =
+        BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static;
+
+    /// <summary>
+    /// Hook for retargeting <see cref="ChaseObject"/> movement before the original buzz chase logic runs.
+    /// </summary>
+    private Hook? _chaseObjectDoBuzzHook;
+
+    /// <summary>
+    /// Hook for retargeting <see cref="ChaseObjectV2"/> movement before the original chase logic runs.
+    /// </summary>
+    private Hook? _chaseObjectV2DoChaseHook;
+
+    /// <summary>
+    /// IL hook for suppressing local-only tink feedback and correcting remote-hit tink effects.
+    /// </summary>
+    private ILHook? _tinkEffectOnTriggerEnter2DHook;
+
+    /// <summary>
+    /// IL hook for suppressing local-only invincibility feedback caused by remote player hits.
+    /// </summary>
+    private ILHook? _healthManagerInvincibleHook;
+
+    /// <summary>
+    /// IL hook for preventing remote player hits from granting local-only rewards or side effects.
+    /// </summary>
+    private ILHook? _healthManagerTakeDamageHook;
+
+    /// <summary>
+    /// Hook for filtering local-only PlayMaker method calls such as hero recoil and bounce feedback.
+    /// </summary>
+    private Hook? _callMethodProperDoMethodCallHook;
+
+    /// <summary>
+    /// Hook for allowing camera lock checks to remain valid while connected and paused.
+    /// </summary>
+    private Hook? _cameraLockAreaIsInApplicableGameStateHook;
+
+    /// <summary>
+    /// Hook for guarding <see cref="Crawler.StopCrawling"/> against destruction-time null reference errors.
+    /// </summary>
+    private Hook? _crawlerStopCrawlingHook;
+
+    /// <summary>
+    /// Hook that repairs SetParticleScale's cached parent state when a death effect is reparented or detached.
+    /// </summary>
+    private Hook? _setParticleScaleParentChangedHook;
+
+    /// <summary>
+    /// Hook for guarding <see cref="WalkerV2.StopWalking"/> against destruction-time null reference errors.
+    /// </summary>
+    private Hook? _walkerV2StopWalkingHook;
+
+    /// <summary>
+    /// Hook for guarding <see cref="Walker.Stop"/> against destruction-time null reference errors.
+    /// </summary>
+    private Hook? _walkerStopHook;
+
+    /// <summary>
+    /// The NetClient instance to check if we are connected to a server.
+    /// </summary>
+    private readonly NetClient _netClient;
+
+    /// <summary>
+    /// The static EntityManager instance used by enemy targeting to avoid scene-wide object scans.
+    /// </summary>
+    private static EntityManager? _entityManagerInstance;
+
+    /// <summary>
+    /// The hooks that are registered while connected to a server.
+    /// </summary>
+    private readonly List<Hook> _hooks = [];
+
+    /// <summary>
+    /// Whether knockback of the local player is currently suppressed because a remote player's attack is being
+    /// processed. See <see cref="DamageEnemiesOnLateFixedUpdate"/>.
+    /// </summary>
+    private bool _suppressHeroKnockback;
+
+    public GamePatcher(NetClient netClient, EntityManager entityManager) {
+        _netClient = netClient;
+        _entityManagerInstance = entityManager;
+    }
+
+    /// <summary>
+    /// Registers all gameplay hooks owned by this patcher.
+    /// </summary>
+    public void RegisterHooks() {
+        _tinkEffectOnTriggerEnter2DHook = TryCreateILHook(
+            typeof(TinkEffect),
+            "TryDoTinkReactionNoDamager",
+            TinkEffectOnTriggerEnter2D,
+            parameterTypes: [
+                typeof(GameObject), typeof(bool), typeof(bool), typeof(bool), typeof(Vector2).MakeByRefType()
+            ]
+        );
+
+        _healthManagerInvincibleHook = TryCreateILHook(
+            typeof(HealthManager), "Invincible", HealthManagerOnInvincible
+        );
+
+        _healthManagerTakeDamageHook = TryCreateILHook(
+            typeof(HealthManager), "TakeDamage", HealthManagerOnTakeDamage
+        );
+
+        _callMethodProperDoMethodCallHook = TryCreateHook(
+            typeof(CallMethodProper), "DoMethodCall", CallMethodProperOnDoMethodCall
+        );
+
+        _cameraLockAreaIsInApplicableGameStateHook = TryCreateHook(
+            typeof(CameraLockArea),
+            "IsInApplicableGameState",
+            CameraLockAreaOnIsInApplicableGameState,
+            StaticNonPublicPublicFlags
+        );
+
+        EventHooks.InteractableBaseAddInsideIL += ILInteractableBaseAddInside;
+        EventHooks.InteractableBaseLocalAddInsideIL += ILInteractableBaseAddInside;
+
+        EventHooks.TransitionPointOnTriggerEnter2DIL += ILTransitionPointOnTrigger2D;
+        EventHooks.TransitionPointOnTriggerStay2DIL += ILTransitionPointOnTrigger2D;
+
+        EventHooks.CameraLockAreaAwake += OnCameraLockAreaAwake;
+
+        _chaseObjectDoBuzzHook = TryCreateHook(
+            typeof(ChaseObject), "DoBuzz", OnChaseObjectDoBuzz, InstanceNonPublicFlags
+        );
+
+        _chaseObjectV2DoChaseHook = TryCreateHook(
+            typeof(ChaseObjectV2), "DoChase", OnChaseObjectV2DoChase, InstanceNonPublicFlags
+        );
+
+        RegisterDetectionHooks();
+
+        _crawlerStopCrawlingHook = TryCreateHook(
+            typeof(Crawler),
+            "StopCrawling",
+            OnCrawlerStopCrawling
+        );
+
+        _setParticleScaleParentChangedHook = TryCreateHook(
+            typeof(EnemyDeathEffects).Assembly.GetType("SetParticleScale"),
+            "OnTransformParentChanged",
+            OnSetParticleScaleParentChanged
+        );
+
+        _walkerV2StopWalkingHook = TryCreateHook(
+            typeof(WalkerV2),
+            "StopWalking",
+            OnWalkerV2StopWalking
+        );
+
+        _walkerStopHook = TryCreateHook(
+            typeof(Walker),
+            "Stop",
+            OnWalkerStop,
+            parameterTypes: typeof(Walker.StopReasons)
+        );
+
+        RegisterAggressionHooks();
+
+        AddHook(typeof(DamageEnemies), nameof(DamageEnemies.LateFixedUpdate), DamageEnemiesOnLateFixedUpdate);
+        AddHook(typeof(HeroController), nameof(HeroController.CanRecoil), HeroControllerOnCanRecoil);
+        AddHook(typeof(HeroController), nameof(HeroController.RecoilDown), HeroControllerOnRecoilDown);
+        AddHook(typeof(BouncePod), nameof(BouncePod.Hit), IgnoreRemoteHit<BouncePod>);
+        AddHook(typeof(BounceBalloon), nameof(BounceBalloon.Hit), IgnoreRemoteHit<BounceBalloon>);
+        AddHook(
+            typeof(NailSlashTerrainThunk),
+            nameof(NailSlashTerrainThunk.OnCollisionEnter2D),
+            NailSlashTerrainThunkOnCollisionEnter2D
+        );
+    }
+
+    /// <summary>
+    /// Creates a runtime detour for an instance or static method when that method exists in the current game version.
+    /// </summary>
+    /// <param name="type">The type that declares the target method.</param>
+    /// <param name="methodName">The name of the target method.</param>
+    /// <param name="detour">The delegate that replaces the target method.</param>
+    /// <param name="flags">Binding flags used to resolve the target method.</param>
+    /// <param name="parameterTypes">The target method's parameter types when overload resolution is required.</param>
+    /// <returns>The registered hook, or <see langword="null"/> when registration fails.</returns>
+    private static Hook? TryCreateHook(
+        Type? type,
+        string methodName,
+        Delegate detour,
+        BindingFlags flags = InstancePublicFlags | InstanceNonPublicFlags,
+        params Type[] parameterTypes
+    ) {
+        if (type == null) {
+            Logger.Error($"Could not find type for #{methodName}; hook was not registered");
+            return null;
+        }
+
+        var method = parameterTypes.Length == 0
+            ? type.GetMethod(methodName, flags)
+            : type.GetMethod(methodName, flags, null, parameterTypes, null);
+
+        if (method == null) {
+            Logger.Error($"Could not find {type.FullName}#{methodName}; hook was not registered");
+            return null;
+        }
+
+        try {
+            return new Hook(method, detour);
+        } catch (Exception e) {
+            Logger.Error($"Could not hook {type.FullName}#{methodName}:\n{e}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Creates a runtime IL detour for an instance or static method when that method exists in the current game version.
+    /// </summary>
+    /// <param name="type">The type that declares the target method.</param>
+    /// <param name="methodName">The name of the target method.</param>
+    /// <param name="manipulator">The IL manipulator that patches the target method body.</param>
+    /// <param name="flags">Binding flags used to resolve the target method.</param>
+    /// <param name="parameterTypes">The target method's parameter types when overload resolution is required.</param>
+    /// <returns>The registered IL hook, or <see langword="null"/> when registration fails.</returns>
+    private static ILHook? TryCreateILHook(
+        Type type,
+        string methodName,
+        ILContext.Manipulator manipulator,
+        BindingFlags flags = InstancePublicFlags | InstanceNonPublicFlags,
+        params Type[] parameterTypes
+    ) {
+        var method = parameterTypes.Length == 0
+            ? type.GetMethod(methodName, flags)
+            : type.GetMethod(methodName, flags, null, parameterTypes, null);
+
+        if (method == null) {
+            Logger.Error($"Could not find {type.FullName}#{methodName}; hook was not registered");
+            return null;
+        }
+
+        try {
+            return new ILHook(method, manipulator);
+        } catch (Exception e) {
+            Logger.Error($"Could not hook {type.FullName}#{methodName}:\n{e}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Deregisters and disposes all gameplay hooks owned by this patcher.
+    /// </summary>
+    public void DeregisterHooks() {
+        _tinkEffectOnTriggerEnter2DHook?.Dispose();
+        _tinkEffectOnTriggerEnter2DHook = null;
+
+        _healthManagerInvincibleHook?.Dispose();
+        _healthManagerInvincibleHook = null;
+
+        _healthManagerTakeDamageHook?.Dispose();
+        _healthManagerTakeDamageHook = null;
+
+        _callMethodProperDoMethodCallHook?.Dispose();
+        _callMethodProperDoMethodCallHook = null;
+
+        _cameraLockAreaIsInApplicableGameStateHook?.Dispose();
+        _cameraLockAreaIsInApplicableGameStateHook = null;
+
+        EventHooks.InteractableBaseAddInsideIL -= ILInteractableBaseAddInside;
+        EventHooks.InteractableBaseLocalAddInsideIL -= ILInteractableBaseAddInside;
+
+        EventHooks.TransitionPointOnTriggerEnter2DIL -= ILTransitionPointOnTrigger2D;
+        EventHooks.TransitionPointOnTriggerStay2DIL -= ILTransitionPointOnTrigger2D;
+
+        EventHooks.CameraLockAreaAwake -= OnCameraLockAreaAwake;
+
+        _chaseObjectDoBuzzHook?.Dispose();
+        _chaseObjectDoBuzzHook = null;
+
+        _chaseObjectV2DoChaseHook?.Dispose();
+        _chaseObjectV2DoChaseHook = null;
+
+        DisposeDetectionHooks();
+        DisposeAggressionHooks();
+
+        _crawlerStopCrawlingHook?.Dispose();
+        _crawlerStopCrawlingHook = null;
+
+        _setParticleScaleParentChangedHook?.Dispose();
+        _setParticleScaleParentChangedHook = null;
+
+        _walkerV2StopWalkingHook?.Dispose();
+        _walkerV2StopWalkingHook = null;
+
+        _walkerStopHook?.Dispose();
+        _walkerStopHook = null;
+
+        foreach (var hook in _hooks) {
+            hook.Dispose();
+        }
+
+        _hooks.Clear();
+        _suppressHeroKnockback = false;
+    }
+
+    /// <summary>
+    /// Create a hook for the method with the given name on the given type and store it, so it can be disposed when
+    /// de-registering the hooks.
+    /// </summary>
+    /// <param name="type">The type that declares the method to hook.</param>
+    /// <param name="methodName">The name of the method to hook.</param>
+    /// <param name="detour">The delegate that replaces the method.</param>
+    private void AddHook(Type type, string methodName, Delegate detour) {
+        var method = type.GetMethod(methodName, InstanceNonPublicFlags | InstancePublicFlags);
+        if (method == null) {
+            Logger.Error($"Could not hook {type.Name}#{methodName}: method does not exist");
+            return;
+        }
+
+        _hooks.Add(new Hook(method, detour));
+    }
+
+    /// <summary>
+    /// Forces <see cref="ChaseObject"/> to consume the enemy-approved multiplayer target before running chase logic.
+    /// </summary>
+    /// <param name="orig">The original chase method.</param>
+    /// <param name="self">The chase action instance.</param>
+    private static void OnChaseObjectDoBuzz(Action<ChaseObject> orig, ChaseObject self) {
+        ForceApprovedTargetOnFsmAction(self);
+
+        if (self.target?.Value == null) {
+            return;
+        }
+
+        orig(self);
+    }
+
+    /// <summary>
+    /// Forces <see cref="ChaseObjectV2"/> to consume the enemy-approved multiplayer target before running chase logic.
+    /// </summary>
+    /// <param name="orig">The original chase method.</param>
+    /// <param name="self">The chase action instance.</param>
+    private static void OnChaseObjectV2DoChase(Action<ChaseObjectV2> orig, ChaseObjectV2 self) {
+        ForceApprovedTargetOnFsmAction(self);
+
+        if (self.target?.Value == null) {
+            return;
+        }
+
+        orig(self);
+    }
+
+    /// <summary>
+    /// Guards <see cref="Crawler.StopCrawling"/> against null-reference failures during destruction or disable.
+    /// </summary>
+    /// <param name="orig">The original <see cref="Crawler.StopCrawling"/> method.</param>
+    /// <param name="self">The crawler instance.</param>
+    private static void OnCrawlerStopCrawling(Action<Crawler> orig, Crawler self) {
+        try {
+            orig(self);
+        } catch (NullReferenceException) {
+            Logger.Debug("Safely caught NullReferenceException in Crawler.StopCrawling");
+        }
+    }
+
+    /// <summary>
+    /// Clears SetParticleScale's stale body cache after a death effect is detached.
+    /// The native method leaves <c>hasParentBody</c> true, so the global callback dereferences the destroyed body.
+    /// </summary>
+    /// <param name="orig">The original SetParticleScale parent-change method.</param>
+    /// <param name="self">The SetParticleScale component instance.</param>
+    private static void OnSetParticleScaleParentChanged(Action<MonoBehaviour> orig, MonoBehaviour self) {
+        orig(self);
+
+        if (self.transform.parent != null) {
+            return;
+        }
+
+        SetSetParticleScaleField(self, "parent", null);
+        SetSetParticleScaleField(self, "hasParent", false);
+        SetSetParticleScaleField(self, "parentBody", null);
+        SetSetParticleScaleField(self, "hasParentBody", false);
+        SetSetParticleScaleField(self, "unparented", true);
+        SetSetParticleScaleField(self, "updated", false);
+    }
+
+    /// <summary>
+    /// Writes one SetParticleScale lifecycle field when it exists in the current game version.
+    /// </summary>
+    /// <param name="component">The SetParticleScale instance.</param>
+    /// <param name="fieldName">The private field name.</param>
+    /// <param name="value">The replacement field value.</param>
+    private static void SetSetParticleScaleField(MonoBehaviour component, string fieldName, object? value) {
+        var field = component.GetType().GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+        );
+        field?.SetValue(component, value);
+    }
+
+    /// <summary>
+    /// Guards <c>WalkerV2.StopWalking</c> against null-reference failures during destruction or disable.
+    /// </summary>
+    /// <param name="orig">The original <c>WalkerV2.StopWalking</c> method.</param>
+    /// <param name="self">The walker instance.</param>
+    private static void OnWalkerV2StopWalking(Action<WalkerV2> orig, WalkerV2 self) {
+        try {
+            orig(self);
+        } catch (NullReferenceException) {
+            Logger.Debug("Safely caught NullReferenceException in WalkerV2.StopWalking");
+        }
+    }
+
+    /// <summary>
+    /// Guards <see cref="Walker.Stop"/> against null-reference failures during destruction or disable.
+    /// </summary>
+    /// <param name="orig">The original <see cref="Walker.Stop"/> method.</param>
+    /// <param name="self">The walker instance.</param>
+    /// <param name="reason">The reason movement is being stopped.</param>
+    private static void OnWalkerStop(
+        Action<Walker, Walker.StopReasons> orig,
+        Walker self,
+        Walker.StopReasons reason
+    ) {
+        try {
+            orig(self, reason);
+        } catch (NullReferenceException) {
+            Logger.Debug("Safely caught NullReferenceException in Walker.Stop");
+        }
+    }
+
+    /// <summary>
+    /// Determines whether a hit source belongs to the local player.
+    /// </summary>
+    /// <param name="source">The source object stored on a hit or attack object.</param>
+    /// <returns>True when the source is local or unknown; otherwise false.</returns>
+    private static bool IsLocalHitSource(GameObject? source) {
+        var root = source.GetHitSourceRoot();
+        if (root == null) {
+            return true;
+        }
+
+        var rootObject = root.gameObject;
+        return rootObject.CompareTag("Player") || rootObject.name == "Knight";
+    }
+
+    /// <summary>
+    /// Determines whether the provided hit instance belongs to the local player.
+    /// </summary>
+    /// <param name="hitInstance">The hit instance to inspect.</param>
+    /// <returns>True when the hit is local or unknown; otherwise false.</returns>
+    private static bool IsLocalHitSource(HitInstance hitInstance) {
+        return IsLocalHitSource(hitInstance.Source);
+    }
+
+    /// <summary>
+    /// Gets the best available world position for a hit source.
+    /// </summary>
+    /// <param name="source">The source object stored on a hit or attack object.</param>
+    /// <returns>The root transform position when available, otherwise the source position or zero.</returns>
+    private static Vector3 GetHitSourcePosition(GameObject? source) {
+        var root = source.GetHitSourceRoot();
+        if (root != null) {
+            return root.position;
+        }
+
+        return source != null ? source.transform.position : Vector3.zero;
+    }
+
+    /// <summary>
+    /// IL hook to change the behaviour of the <see cref="InteractableBase"/> to add a check for whether it is dealing
+    /// with the local player.
+    /// </summary>
+    private void ILInteractableBaseAddInside(ILContext il) {
+        try {
+            // Create a cursor for this context
+            var c = new ILCursor(il);
+
+            var beforeFirstReturnLabel = c.DefineLabel();
+
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdarg(1),
+                i => i.MatchCallvirt(typeof(Component), "get_gameObject"),
+                i => i.MatchCallvirt(typeof(GameObject), "get_layer"),
+                i => i.MatchLdcI4(9),
+                i => i.MatchBeq(out _)
+            );
+
+            c.Emit(OpCodes.Ldarg_1);
+            // Emit a delegate that pops the collider argument off the stack and pushes a boolean onto the stack
+            // that indicates whether the collider's game object has the tag "Player"
+            c.EmitDelegate<Func<Collider2D, bool>>(col => col.gameObject.tag == "Player");
+
+            // Branch if the tag is not "Player" to the pre-defined label, which is before the return
+            // In other words, we return if it is not the local player
+            c.Emit(OpCodes.Brfalse, beforeFirstReturnLabel);
+
+            // Goto before the next return to mark our label there, so we can branch to it
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchRet()
+            );
+
+            c.MarkLabel(beforeFirstReturnLabel);
+        } catch (Exception e) {
+            Logger.Error($"Could not change InteractableBase#AddInside IL:\n{e}");
+        }
+    }
+
+    /// <summary>
+    /// IL hook to change the behaviour of the <see cref="TransitionPoint"/> to add a check for whether it is dealing
+    /// with the local player.
+    /// </summary>
+    private void ILTransitionPointOnTrigger2D(ILContext il) {
+        try {
+            // Create a cursor for this context
+            var c = new ILCursor(il);
+
+            ILLabel? returnLabel = null;
+
+            c.GotoNext(
+                MoveType.After,
+                i => i.MatchLdarg(1),
+                i => i.MatchCallvirt(typeof(Component), "get_gameObject"),
+                i => i.MatchCallvirt(typeof(GameObject), "get_layer"),
+                i => i.MatchLdcI4(9),
+                i => i.MatchBneUn(out returnLabel)
+            );
+
+            if (returnLabel == null) {
+                Logger.Error($"Could not change TransitionPoint#OnTrigger{{Enter,Stay}}2D IL:\nCould not find label");
+                return;
+            }
+
+            c.Emit(OpCodes.Ldarg_1);
+            // Emit a delegate that pops the collider argument off the stack and pushes a boolean onto the stack
+            // that indicates whether the collider's game object has the tag "Player"
+            c.EmitDelegate<Func<Collider2D, bool>>(movingObj => movingObj.gameObject.tag == "Player");
+
+            // Branch if the tag is not "Player" to the pre-defined label, which is before the return
+            // In other words, we return if it is not the local player
+            c.Emit(OpCodes.Brfalse, returnLabel);
+        } catch (Exception e) {
+            Logger.Error($"Could not change TransitionPoint#OnTrigger{{Enter,Stay}}2D IL:\n{e}");
+        }
+    }
+
+    /// <summary>
+    /// IL hook to change the tink reaction flow so remote player hits do not trigger local-only feedback.
+    /// </summary>
+    private void TinkEffectOnTriggerEnter2D(ILContext il) {
+        try {
+            var c = new ILCursor(il);
+            c.Emit(OpCodes.Ldarg_1);
+
+            var isLocalPlayer = true;
+            c.EmitDelegate<Action<GameObject>>(source => { isLocalPlayer = IsLocalHitSource(source); });
+
+            // Replace the local-hero position with the remote player's root position for spawned tink effects.
+            c.GotoNext(
+                MoveType.After,
+                i => i.MatchStloc(6)
+            );
+
+            var afterRemotePositionLabel = c.DefineLabel();
+            c.EmitDelegate(() => isLocalPlayer);
+            c.Emit(OpCodes.Brtrue, afterRemotePositionLabel);
+            c.Emit(OpCodes.Ldarg_1);
+            c.EmitDelegate<Func<GameObject, Vector3>>(GetHitSourcePosition);
+            c.Emit(OpCodes.Stloc, 6);
+            c.MarkLabel(afterRemotePositionLabel);
+
+            // Skip the camera shake block for remote hits.
+            c.GotoNext(
+                MoveType.After,
+                i => i.MatchLdarg(2),
+                i => i.MatchLdloc(1),
+                i => i.MatchAnd(),
+                i => i.MatchBrfalse(out _)
+            );
+
+            var afterCameraShakeLabel = c.DefineLabel();
+            c.EmitDelegate(() => isLocalPlayer);
+            c.Emit(OpCodes.Brfalse, afterCameraShakeLabel);
+
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdloca(13)
+            );
+
+            c.MarkLabel(afterCameraShakeLabel);
+
+            // Skip local recoil feedback for remote hits.
+            foreach (var recoilMethod in new[] { "RecoilLeft", "RecoilDown", "RecoilRight" }) {
+                c.GotoNext(
+                    MoveType.Before,
+                    inst => inst.MatchLdloc(4),
+                    inst => inst.MatchCallvirt(typeof(HeroController), recoilMethod)
+                );
+
+                var afterRecoilLabel = c.DefineLabel();
+                c.EmitDelegate(() => isLocalPlayer);
+                c.Emit(OpCodes.Brfalse, afterRecoilLabel);
+                c.GotoNext(
+                    MoveType.After,
+                    inst => inst.MatchLdloc(4),
+                    inst => inst.MatchCallvirt(typeof(HeroController), recoilMethod)
+                );
+                c.MarkLabel(afterRecoilLabel);
+            }
+
+            // Skip the optional FSM event for remote hits.
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(TinkEffect), "sendFSMEvent"),
+                i => i.MatchBrfalse(out _),
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(TinkEffect), "fsm"),
+                i => i.MatchCall(typeof(UnityEngine.Object), "op_Implicit"),
+                i => i.MatchBrfalse(out _)
+            );
+
+            var afterSendEventLabel = c.DefineLabel();
+            c.EmitDelegate(() => isLocalPlayer);
+            c.Emit(OpCodes.Brfalse, afterSendEventLabel);
+            c.GotoNext(
+                MoveType.After,
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(TinkEffect), "fsm"),
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(TinkEffect), "FSMEvent"),
+                i => i.MatchCallvirt(typeof(PlayMakerFSM), "SendEvent")
+            );
+            c.MarkLabel(afterSendEventLabel);
+        } catch (Exception e) {
+            Logger.Error($"Could not change TinkEffect#OnTriggerEnter2D IL:\n{e}");
+        }
+    }
+
+    private void HealthManagerOnInvincible(ILContext il) {
+        try {
+            var c = new ILCursor(il);
+            c.Emit(OpCodes.Ldarg_1);
+
+            var isLocalPlayer = true;
+            c.EmitDelegate<Action<HitInstance>>(hitInstance => { isLocalPlayer = IsLocalHitSource(hitInstance); });
+
+            // Skip the local recoil and blocked-hit shake for remote hits.
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(HealthManager), "preventInvincibleShake"),
+                i => i.MatchBrtrue(out _)
+            );
+
+            var afterLocalFeedbackLabel = c.DefineLabel();
+            c.EmitDelegate(() => isLocalPlayer);
+            c.Emit(OpCodes.Brfalse, afterLocalFeedbackLabel);
+
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(HealthManager), "boxCollider"),
+                i => i.MatchStloc(6)
+            );
+
+            c.MarkLabel(afterLocalFeedbackLabel);
+        } catch (Exception e) {
+            Logger.Error($"Could not change HealthManager#OnInvincible IL:\n{e}");
+        }
+    }
+
+    /// <summary>
+    /// IL Hook to modify the behaviour of the TakeDamage method in HealthManager. This modification adds a
+    /// conditional branch in case the nail swing from the HitInstance was from a remote player to ensure that
+    /// soul is not gained for remote hits.
+    /// </summary>
+    private void HealthManagerOnTakeDamage(ILContext il) {
+        try {
+            var c = new ILCursor(il);
+
+            // Remote hits must not grant the local player silk or reaper payouts.
+            ILLabel? targetLabel = null;
+            c.GotoNext(
+                MoveType.Before,
+                i => i.MatchLdarg(0),
+                i => i.MatchLdfld(typeof(HealthManager), "enemyType"),
+                i => i.MatchLdcI4(3),
+                i => i.MatchBeq(out targetLabel)
+            );
+
+            c.Emit(OpCodes.Ldarg_1);
+            c.EmitDelegate<Func<HitInstance, bool>>(hitInstance => !IsLocalHitSource(hitInstance));
+            c.Emit(OpCodes.Brtrue, targetLabel);
+        } catch (Exception e) {
+            Logger.Error($"Could not change HealthManager#TakeDamage IL:\n{e}");
+        }
+    }
+
+    /// <summary>
+    /// Hook for the 'DoMethodCall' method in the 'CallMethodProper' FSM action. This is used for the Crystal Shot
+    /// game object to ensure that knockback is not applied to the local player if a remote player hits the crystal.
+    /// </summary>
+    private void CallMethodProperOnDoMethodCall(
+        Action<CallMethodProper> orig,
+        CallMethodProper self
+    ) {
+        // If the 'behaviour' and 'methodName' strings do not match, we execute the original method and return
+        if (self.behaviour.Value != "HeroController" ||
+            self.methodName.Value != "RecoilLeft" &&
+            self.methodName.Value != "RecoilRight" &&
+            self.methodName.Value != "RecoilDown" &&
+            self.methodName.Value != "Bounce"
+           ) {
+            orig(self);
+            return;
+        }
+
+        // If the state does not match, we return as well
+        if (!self.State.Name.StartsWith("No Box ") && !self.State.Name.StartsWith("Blocked ")) {
+            orig(self);
+            return;
+        }
+
+        Transform attacks;
+
+        // Find either the 'Damager' or the 'Collider' game object from the FSM variables, and check up the hierarchy.
+        // If it matches the local player's object, then we know it was the local player's slash and not a remote
+        // player's slash
+        var damager = self.Fsm.Variables.FindFsmGameObject("Damager");
+        var collider = self.Fsm.Variables.FindFsmGameObject("Collider");
+        if (damager != null && damager.Value != null) {
+            attacks = damager.Value.transform.parent;
+        } else if (collider != null && collider.Value != null && collider.Value.transform.parent != null) {
+            attacks = collider.Value.transform.parent.parent;
+        } else {
+            orig(self);
+            return;
+        }
+
+        if (attacks == null) {
+            orig(self);
+            return;
+        }
+
+        var knight = attacks.parent;
+        if (knight == null) {
+            orig(self);
+            return;
+        }
+
+        if (knight.name.Equals("Knight")) {
+            orig(self);
+        }
+    }
+
+    /// <summary>
+    /// Hook for the 'IsInApplicableGameState' method in 'CameraLockArea'. This is used to add a check
+    /// for being in the pause menu and connected to a server. Otherwise, the camera will sometimes not lock while
+    /// in the pause menu during host transfers.
+    /// </summary>
+    private bool CameraLockAreaOnIsInApplicableGameState(Func<bool> orig) {
+        try {
+            if (_netClient.IsConnected && PauseManager.IsMultiplayerPauseMenuOpen) {
+                return true;
+            }
+
+            return orig();
+        } catch (Exception e) {
+            Logger.Error($"Could not change CameraLockArea#IsInApplicableGameState hook: \n{e}");
+            return orig();
+        }
+    }
+
+    /// <summary>
+    /// Hook to add a tag include to the <see cref="TrackTriggerObjects"/> of <see cref="CameraLockArea"/> to ensure
+    /// that it only triggers on the local player.
+    /// </summary>
+    private void OnCameraLockAreaAwake(CameraLockArea cameraLockArea) {
+        cameraLockArea.tagIncludeList ??= [];
+        cameraLockArea.tagIncludeList.Add("Player");
+    }
+
+    /// <summary>
+    /// Hook for <see cref="DamageEnemies"/>.<see cref="DamageEnemies.LateFixedUpdate"/>, which is where a damager
+    /// evaluates its collisions and calls <see cref="IHitResponder.Hit"/> on everything it hit.
+    /// <para>
+    /// Interactable objects that knock the player back when hit (such as the bounce pods in Greymoor, levers and
+    /// anything with a <see cref="TinkEffect"/>) do so by calling into <see cref="HeroController.instance"/>
+    /// directly, because in a single player game the only thing that can hit them is the local player. Remote
+    /// players' attacks are replicated locally, so without this patch a remote player hitting such an object knocks
+    /// the local player back as well. While a remote player's damager is being processed, we therefore suppress the
+    /// knockback that would be applied to the local player.
+    /// </para>
+    /// </summary>
+    private void DamageEnemiesOnLateFixedUpdate(Action<DamageEnemies> orig, DamageEnemies self) {
+        if (!RemoteAttackComponent.IsRemoteAttack(self.gameObject)) {
+            orig(self);
+            return;
+        }
+
+        // Store the previous value instead of resetting to false, since damagers can be processed nested
+        var lastSuppress = _suppressHeroKnockback;
+        _suppressHeroKnockback = true;
+
+        try {
+            orig(self);
+        } finally {
+            _suppressHeroKnockback = lastSuppress;
+        }
+    }
+
+    /// <summary>
+    /// Hook for <see cref="HeroController"/>.<see cref="HeroController.CanRecoil"/> to prevent the local player from
+    /// recoiling horizontally while a remote player's attack is being processed. This is the single check that all
+    /// horizontal recoil methods of <see cref="HeroController"/> go through, so patching it here also prevents the
+    /// side effects of those methods, such as cancelling the local player's attack.
+    /// </summary>
+    private bool HeroControllerOnCanRecoil(Func<HeroController, bool> orig, HeroController self) {
+        if (_suppressHeroKnockback) {
+            return false;
+        }
+
+        return orig(self);
+    }
+
+    /// <summary>
+    /// Hook for <see cref="HeroController"/>.<see cref="HeroController.RecoilDown"/> to prevent the local player from
+    /// being pushed down while a remote player's attack is being processed. Downwards recoil does not go through
+    /// <see cref="HeroController.CanRecoil"/>, so it needs its own patch.
+    /// </summary>
+    private void HeroControllerOnRecoilDown(Action<HeroController> orig, HeroController self) {
+        if (_suppressHeroKnockback) {
+            return;
+        }
+
+        orig(self);
+    }
+
+    /// <summary>
+    /// Hook for the <see cref="IHitResponder.Hit"/> implementation of <see cref="BouncePod"/> and
+    /// <see cref="BounceBalloon"/> to ignore hits from remote players entirely. Both of these fling the local player
+    /// away from a downwards hit after a delay: the pod through a static queue that is handled in a later frame and
+    /// the balloon through a coroutine. That happens outside the scope in which
+    /// <see cref="DamageEnemiesOnLateFixedUpdate"/> suppresses knockback, so it has to be prevented here instead.
+    /// </summary>
+    private IHitResponder.HitResponse IgnoreRemoteHit<T>(
+        Func<T, HitInstance, IHitResponder.HitResponse> orig,
+        T self,
+        HitInstance damageInstance
+    ) where T : IHitResponder {
+        if (RemoteAttackComponent.IsRemoteAttack(damageInstance.Source)) {
+            return IHitResponder.Response.None;
+        }
+
+        return orig(self, damageInstance);
+    }
+
+    /// <summary>
+    /// Hook for <see cref="NailSlashTerrainThunk"/>.<see cref="NailSlashTerrainThunk.OnCollisionEnter2D"/> to ignore
+    /// terrain collisions of remote players' nail slashes. The terrain thunk recoils the local player when a slash
+    /// hits a wall with a <see cref="TinkEffect"/>. It also dereferences the <see cref="HeroController"/> of the
+    /// player that the slash belongs to, which does not exist for a remote player.
+    /// </summary>
+    private void NailSlashTerrainThunkOnCollisionEnter2D(
+        Action<NailSlashTerrainThunk, Collision2D> orig,
+        NailSlashTerrainThunk self,
+        Collision2D collision
+    ) {
+        if (RemoteAttackComponent.IsRemoteAttack(self.gameObject)) {
+            return;
+        }
+
+        orig(self, collision);
+    }
+}

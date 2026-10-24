@@ -1,0 +1,286 @@
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using SSMP.Api.Command.Server;
+using SSMP.Game.Server;
+using SSMP.Game.Server.Auth;
+using SSMP.Networking.Packet.Data;
+using SSMP.Util;
+using SSMP.Api.Command;
+
+namespace SSMP.Game.Command.Server;
+
+/// <summary>
+/// Command for banning users by username, auth key, Steam ID, or IP address.
+/// Supports both regular bans and IP bans, as well as unbanning.
+/// </summary>
+internal class BanCommand : IServerCommand, ICommandWithDescription {
+    /// <inheritdoc />
+    public string Trigger => "/ban";
+
+    /// <inheritdoc />
+    public string[] Aliases => ["/unban", "/banip", "/unbanip"];
+
+    /// <inheritdoc />
+    public string Description =>
+        "Ban players by auth key or username. IP bans will ban the player's IP address (UDP clients) or Steam ID (Steam clients).";
+
+    /// <inheritdoc />
+    public bool AuthorizedOnly => true;
+
+    /// <summary>
+    /// The ban list instance.
+    /// </summary>
+    private readonly BanList _banList;
+
+    /// <summary>
+    /// The server manager instance.
+    /// </summary>
+    private readonly ServerManager _serverManager;
+
+    /// <summary>
+    /// Constructs a new ban command with the given dependencies.
+    /// </summary>
+    /// <param name="banList">The ban list instance.</param>
+    /// <param name="serverManager">The server manager instance.</param>
+    public BanCommand(BanList banList, ServerManager serverManager) {
+        _banList = banList;
+        _serverManager = serverManager;
+    }
+
+    /// <inheritdoc />
+    public void Execute(ICommandSender commandSender, string[] args) {
+        var commandType = ParseCommandType(args[0]);
+        
+        if (args.Length < 2) {
+            SendUsage(commandSender, commandType);
+            return;
+        }
+
+        var identifier = args[1];
+
+        // Handle "all" keyword for clearing bans
+        if (identifier == "all" && commandType.IsUnban) {
+            HandleClearAllBans(commandSender, commandType.IsIpBan);
+            return;
+        }
+
+        if (commandType.IsUnban) {
+            HandleUnban(commandSender, identifier, commandType.IsIpBan);
+        } else {
+            HandleBan(commandSender, identifier, commandType.IsIpBan);
+        }
+    }
+
+    /// <summary>
+    /// Parses the command type from the trigger string.
+    /// </summary>
+    private static CommandType ParseCommandType(string trigger) => new(
+        IsIpBan: trigger.Contains("ip"),
+        IsUnban: trigger.Contains("unban")
+    );
+
+    /// <summary>
+    /// Handles unbanning operations for auth keys or IP addresses.
+    /// </summary>
+    private void HandleUnban(ICommandSender sender, string identifier, bool isIpBan) {
+        var players = _serverManager.Players.Cast<ServerPlayerData>();
+
+        if (isIpBan) {
+            // Unban IP Logic
+            // Try to resolve as Username first to get identifier
+            if (CommandUtil.TryGetPlayerByName(_serverManager.Players, identifier, out var player)) {
+                UnbanIdentifier(sender, player.UniqueClientIdentifier);
+                return;
+            }
+
+            // Try to resolve as AuthKey to get identifier
+            if (AuthUtil.IsValidAuthKey(identifier)) {
+                if (CommandUtil.TryGetPlayerByAuthKey(players, identifier, out var authKeyPlayer)) {
+                    UnbanIdentifier(sender, authKeyPlayer.UniqueClientIdentifier);
+                    return;
+                }
+            }
+
+            // Assume Identifier (IP or SteamID)
+            UnbanIdentifier(sender, identifier);
+        } else {
+            // Unban logic (AuthKey based)
+            // Try to resolve as Username first to get AuthKey
+            if (CommandUtil.TryGetPlayerByName(_serverManager.Players, identifier, out var player)) {
+                UnbanAuthKey(sender, player.AuthKey);
+                return;
+            }
+            
+            // Assume AuthKey
+            if (AuthUtil.IsValidAuthKey(identifier)) {
+                UnbanAuthKey(sender, identifier);
+                return;
+            }
+
+            sender.SendMessage($"Could not find player or valid AuthKey matching '{identifier}'");
+        }
+    }
+
+    /// <summary>
+    /// Handles banning operations by identifier.
+    /// </summary>
+    private void HandleBan(ICommandSender sender, string identifier, bool isIpBan) {
+        var players = _serverManager.Players.Cast<ServerPlayerData>().ToList();
+
+        if (isIpBan) {
+            // Ban IP logic: Target Identifier (IP/SteamID)
+            // 1. Try IP Address directly
+            if (IPAddress.TryParse(identifier, out var address)) {
+                BanIdentifier(sender, address.ToString(), players);
+                return;
+            }
+
+            // 2. Try Username -> Identifier resolution
+            if (CommandUtil.TryGetPlayerByName(_serverManager.Players, identifier, out var player)) {
+                BanIdentifier(sender, player.UniqueClientIdentifier, players);
+                return;
+            }
+
+            // 3. Try AuthKey -> Identifier resolution
+            if (AuthUtil.IsValidAuthKey(identifier)) {
+                if (CommandUtil.TryGetPlayerByAuthKey(players, identifier, out var authPlayer)) {
+                    BanIdentifier(sender, authPlayer.UniqueClientIdentifier, players);
+                    return;
+                }
+            }
+
+            // 4. Fallback: Assume the input IS the Identifier (e.g. SteamID)
+            BanIdentifier(sender, identifier, players);
+        } else {
+            // Ban logic: Target AuthKey
+            // 1. Try Username -> AuthKey resolution
+            if (CommandUtil.TryGetPlayerByName(_serverManager.Players, identifier, out var player)) {
+                var playerData = (ServerPlayerData) player;
+                BanAuthKey(sender, playerData);
+                return;
+            }
+
+            // 2. Try direct AuthKey
+            if (AuthUtil.IsValidAuthKey(identifier)) {
+                // Try to find existing player with this auth key
+                CommandUtil.TryGetPlayerByAuthKey(players, identifier, out var existingPlayer);
+                if (existingPlayer != null) {
+                    BanAuthKey(sender, existingPlayer);
+                } else {
+                    // Offline ban by key
+                    _banList.Add(identifier);
+                    sender.SendMessage($"Auth key '{identifier}' has been banned.");
+                }
+                return;
+            }
+             
+            sender.SendMessage($"Could not find player or valid AuthKey matching '{identifier}'");
+        }
+    }
+
+    /// <summary>
+    /// Bans a player by their identifier (IP address or Steam ID) and kicks them if online.
+    /// </summary>
+    private void BanIdentifier(ICommandSender sender, string identifier, IEnumerable<ServerPlayerData> players) {
+        var isIp = IPAddress.TryParse(identifier, out _);
+        var idTypeMsg = isIp ? "IP Address" : "Identifier";
+        
+        if (!_banList.AddIp(identifier)) {
+            sender.SendMessage($"{idTypeMsg} '{identifier}' is already banned.");
+            return;
+        }
+
+        sender.SendMessage($"{idTypeMsg} '{identifier}' has been banned");
+
+        // Use CommandUtil to find and kick matching players
+        if (isIp) {
+            // For IP addresses, use the dedicated utility method
+            if (CommandUtil.TryGetPlayerByIpAddress(players, identifier, out var player)) {
+                DisconnectPlayer(player);
+            }
+        } else {
+            // For Steam IDs, check for exact identifier match
+            foreach (var p in players) {
+                if (p.UniqueClientIdentifier == identifier) {
+                    DisconnectPlayer(p);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bans a player by their auth key and disconnects them.
+    /// </summary>
+    private void BanAuthKey(ICommandSender sender, ServerPlayerData playerData) {
+        if (!_banList.Add(playerData.AuthKey)) {
+            sender.SendMessage($"Player '{playerData.Username}' is already banned (AuthKey).");
+            // Disconnect anyway
+            DisconnectPlayer(playerData);
+            return;
+        }
+         
+        sender.SendMessage($"Player '{playerData.Username}' has been banned (AuthKey).");
+        DisconnectPlayer(playerData);
+    }
+
+    /// <summary>
+    /// Unbans an identifier (IP address or Steam ID).
+    /// </summary>
+    private void UnbanIdentifier(ICommandSender sender, string identifier) {
+        if (!_banList.RemoveIp(identifier)) {
+            sender.SendMessage($"Identifier '{identifier}' is not banned.");
+            return;
+        }
+        sender.SendMessage($"Identifier '{identifier}' has been unbanned.");
+    }
+
+    /// <summary>
+    /// Unbans an auth key.
+    /// </summary>
+    private void UnbanAuthKey(ICommandSender sender, string authKey) {
+        if (!_banList.Remove(authKey)) {
+            sender.SendMessage($"Auth key '{authKey}' is not banned.");
+            return;
+        }
+        sender.SendMessage($"Auth key '{authKey}' has been unbanned.");
+    }
+    
+    /// <summary>
+    /// Clears all bans of a specific type.
+    /// </summary>
+    private void HandleClearAllBans(ICommandSender sender, bool isIpBan) {
+        if (isIpBan) {
+            _banList.ClearIps();
+            sender.SendMessage("Cleared all IP addresses from ban list");
+        } else {
+            _banList.Clear();
+            sender.SendMessage("Cleared all auth keys from ban list");
+        }
+    }
+
+    /// <summary>
+    /// Disconnects a player with a banned status.
+    /// </summary>
+    private void DisconnectPlayer(ServerPlayerData playerData) => 
+        _serverManager.InternalDisconnectPlayer(playerData.Id, DisconnectReason.Banned);
+
+    /// <summary>
+    /// Sends appropriate usage information based on command type.
+    /// </summary>
+    private void SendUsage(ICommandSender sender, CommandType type) {
+        var message = (type.IsIpBan, type.IsUnban) switch {
+            (true, true) => $"{Aliases[2]} <username|auth key|ip|steam id|all>",
+            (true, false) => $"{Aliases[1]} <username|auth key|ip|steam id>",
+            (false, true) => $"{Aliases[0]} <username|auth key|all>",
+            (false, false) => $"{Trigger} <username|auth key>"
+        };
+
+        sender.SendMessage(message);
+    }
+
+    /// <summary>
+    /// Represents the type of ban command being executed.
+    /// </summary>
+    private readonly record struct CommandType(bool IsIpBan, bool IsUnban);
+}
