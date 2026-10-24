@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <GameManagedPath Condition="'$(GameManagedPath)' == ''">C:/Program Files (x86)/Steam/steamapps/common/Hollow Knight Silksong/Hollow Knight Silksong_Data/Managed</GameManagedPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SSMP/SSMP.csproj" />
+    <ProjectReference Include="../SSMPServer/SSMPServer.csproj" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="MonoMod.RuntimeDetour" Version="21.12.13.1" />
+    <Reference Include="Assembly-CSharp"><HintPath>$(GameManagedPath)/Assembly-CSharp.dll</HintPath></Reference>
+    <Reference Include="Assembly-CSharp-firstpass"><HintPath>$(GameManagedPath)/Assembly-CSharp-firstpass.dll</HintPath></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedPath)/UnityEngine.CoreModule.dll</HintPath></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(GameManagedPath)/UnityEngine.dll</HintPath></Reference>
+    <Reference Include="TeamCherry.SharedUtils"><HintPath>$(GameManagedPath)/TeamCherry.SharedUtils.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

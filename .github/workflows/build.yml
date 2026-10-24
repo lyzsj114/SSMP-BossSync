@@ -1,0 +1,64 @@
+name: Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 9.x
+
+      - name: Build
+        run: dotnet build -c Release --verbosity normal
+
+      - name: Pack NuGet
+        working-directory: ./SSMP
+        run: dotnet pack -o nuget/
+
+      # Upload SSMP artifact only for the Linux runner, since it is platform independent
+      - name: Upload SSMP artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SSMP
+          path: ${{ github.workspace }}/bin/Release/netstandard2.1/
+          
+      # Upload the SSMPServer artifact for all three platforms, since it is platform dependent
+      - name: Upload SSMPServer (Linux) artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SSMPServer-linux
+          path: ${{ github.workspace }}/bin/Release/net9.0/
+          
+      - name: Upload SSMPServer (Windows) artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SSMPServer-windows
+          path: ${{ github.workspace }}/bin/Release/net9.0/
+
+      - name: Upload SSMPServer (Mac) artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SSMPServer-macos
+          path: ${{ github.workspace }}/bin/Release/net9.0/
+
+      # Upload the NuGet package
+      - name: Upload NuGet artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          path: SSMP/nuget/*.nupkg
+          archive: false
