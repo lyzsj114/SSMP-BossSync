@@ -1,0 +1,74 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- 
+    Imports local build properties only if present in order to allow CI builds. The file should be gitignored.
+    If you are checking out from git and need to create a new one, copy the 'LocalBuildProperties_example.props' to
+    'LocalBuildProperties.props'.
+    -->
+    <Import Condition="Exists('LocalBuildProperties.props')" Project="LocalBuildProperties.props"/>
+
+    <PropertyGroup>
+        <TargetFramework>netstandard2.1</TargetFramework>
+        <LangVersion>preview</LangVersion>
+        <Nullable>enable</Nullable>
+        <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+        <!-- CI environment variable is automatically set by GitHub actions -->
+        <RestoreLockedMode Condition="'$(CI)' == 'true'">True</RestoreLockedMode>
+        <!--Allow access of private members at runtime.-->
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!--Shortens and anonymizes paths in debug symbols relative to the project directory. Breakpoints will not work, however.-->
+        <PathMap Condition="'$(Configuration)' == 'Release'">$(MSBuildProjectDirectory)=source</PathMap>
+        <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
+        <PackageLicenseExpression>LGPL-2.1-or-later</PackageLicenseExpression>
+        <!-- Place build output under parent folder bin instead of nested SSMP/SSMP/bin -->
+        <BaseOutputPath>..\bin\</BaseOutputPath>
+
+        <!-- Ensure PDBs are generated for profiling -->
+        <DebugSymbols>true</DebugSymbols>
+        <DebugType>portable</DebugType>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <!--These properties will control the generated PluginInfo. Version is also used by various parts of the build system.-->
+        <AssemblyTitle>SSMP</AssemblyTitle>
+        <Version>0.3.1.3</Version>
+        <PackageId>Silksong.SSMP</PackageId>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="SSMPServer"/>
+        <InternalsVisibleTo Include="SSMP.SaveSync.Tests"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="Ui\Resources\Images\*.png"/>
+        <EmbeddedResource Include="Ui\Resources\Images\*.dat"/>
+        <EmbeddedResource Include="Resource\entity-registry.json"/>
+        <EmbeddedResource Include="Resource\action-registry.json"/>
+        <EmbeddedResource Include="Resource\save-data.json"/>
+        <EmbeddedResource Include="Resource\string-data.json"/>
+        <EmbeddedResource Include="Resource\music-data.json"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="BepInEx.Analyzers" Version="1.0.8" PrivateAssets="all"/>
+        <PackageReference Include="BepInEx.Core" Version="5.4.21" IncludeAssets="compile" PrivateAssets="all"/>
+        <PackageReference Include="Hamunii.BepInEx.AutoPlugin" Version="2.1.0" PrivateAssets="all"/>
+        <PackageReference Include="UnityEngine.Modules" Version="6000.0.50" IncludeAssets="compile" PrivateAssets="all"/>
+        <!--If you're unable resolve this dependency, check that you're using the nuget v3 package feed instead of v2.-->
+        <PackageReference Include="Silksong.GameLibs" Version="*-*" PrivateAssets="all"/>
+        <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" PrivateAssets="all"/>
+    </ItemGroup>
+
+    <Target Name="CopyMod" AfterTargets="PostBuildEvent" Condition="'@(OutputDirectory)' != ''">
+        <ItemGroup>
+            <Binaries Include="$(TargetPath)"/>
+            <Binaries Include="$(TargetDir)/$(TargetName).pdb"/>
+            <Binaries Include="$(TargetDir)/*.dll"/>
+        </ItemGroup>
+
+        <Copy SourceFiles="@(Binaries)" DestinationFolder="%(OutputDirectory.Identity)/"/>
+    </Target>
+</Project>
